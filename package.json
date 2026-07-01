@@ -1,0 +1,32 @@
+{
+  "name": "@xnetx/raft-hlc-sync",
+  "version": "0.0.1",
+  "description": "pure javascript raft and hlc sync protocol",
+  "keywords": [
+    "raft",
+    "hlc",
+    "sync",
+    "database",
+    "sqlite",
+    "mysql",
+    "postgresql"
+  ],
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "xnet",
+  "type": "module",
+  "main": "index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xnetsc/raft-hlc-sync.git"
+  },
+  "homepage": "https://github.com/xnetsc/raft-hlc-sync#readme",
+  "bugs": {
+    "url": "https://github.com/xnetsc/raft-hlc-sync/issues"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.4"
+  }
+}

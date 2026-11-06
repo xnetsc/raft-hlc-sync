@@ -501,6 +501,16 @@ export function getPeerLastSyncId(db, peerKey) {
     return row?.last_sync_id || 0;
 }
 
+/**
+ * 读取 peer 水位行（区分"无记录"与"水位为 0"）。
+ * 无记录返回 null：调用方不应把缺失水位当作从 0 同步，而应改走最大序号
+ * 比对（见 sync-engine 的 _tickPull / _pushToAllPeers）。
+ */
+export function getPeerWatermark(db, peerKey) {
+    const row = db.get('SELECT last_sync_id FROM _sync_peers WHERE peer_key = ?', [peerKey]);
+    return row ? row.last_sync_id : null;
+}
+
 export function updatePeerSyncId(db, peerKey, lastSyncId, getNow) {
     const cols = ['peer_key', 'last_sync_id', 'last_sync_at'];
     const keys = ['peer_key'];

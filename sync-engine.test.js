@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SyncEngine } from './sync-engine.js';
+import { getPeerWatermark } from './sync-protocol.js';
 
 // ═══════════════════════════════════════════════════
 //  Helpers
@@ -2068,5 +2069,111 @@ describe('SyncEngine bidirectional time sync', () => {
         engine.start();
         expect(setIntervalCalls.length).toBe(3);
         engine.stop();
+    });
+});
+
+// ═══════════════════════════════════════════════════
+//  Missing peer watermark: max-seq comparison (no replay from 0)
+// ═══════════════════════════════════════════════════
+
+describe('SyncEngine missing peer watermark', () => {
+    function seedLog(db, count) {
+        const t = db._tables._sync_log || (db._tables._sync_log = []);
+        for (let i = 1; i <= count; i++) {
+            t.push({ id: i, table_name: 'users', operation: 'INSERT', row_key: JSON.stringify({ user_id: 'u' + i }), row_data: JSON.stringify({ user_id: 'u' + i }), _hlc: 'hlc-' + i });
+        }
+    }
+    function sentMessages(onSendToPeer) {
+        return onSendToPeer.mock.calls.map(c => JSON.parse(c[1]));
+    }
+    function connectAndHandshake(engine, { direction = 'outbound', lastSeq } = {}) {
+        engine.peerConnected('p1', { direction });
+        const hs = { type: 'handshake', nodeId: 'remote-1' };
+        if (lastSeq !== undefined) hs.lastSeq = lastSeq;
+        engine.receiveMessage('p1', JSON.stringify(hs));
+    }
+
+    it('getPeerWatermark distinguishes a missing row from a zero watermark', () => {
+        const db = createInMemoryDb();
+        expect(getPeerWatermark(db, 'nobody')).toBe(null);
+        db._tables._sync_peers = [{ peer_key: 'zero', last_sync_id: 0, last_sync_at: null }];
+        expect(getPeerWatermark(db, 'zero')).toBe(0);
+    });
+
+    it('pull with an existing watermark sends pull_req from that watermark', () => {
+        const onSendToPeer = vi.fn();
+        const { engine, db } = createEngine({ onSendToPeer });
+        db._tables._sync_peers = [{ peer_key: 'remote-1', last_sync_id: 7, last_sync_at: null }];
+        connectAndHandshake(engine, { lastSeq: 0 });
+        onSendToPeer.mockClear();
+        engine._tickPull();
+        const pulls = sentMessages(onSendToPeer).filter(m => m.type === 'pull_req');
+        expect(pulls).toHaveLength(1);
+        expect(pulls[0].sinceSeq).toBe(7);
+    });
+
+    it('pull without a watermark does not replay from 0 when the peer is not ahead', () => {
+        const onSendToPeer = vi.fn();
+        const { engine, db } = createEngine({ onSendToPeer });
+        seedLog(db, 5);
+        connectAndHandshake(engine, { lastSeq: 5 });
+        onSendToPeer.mockClear();
+        engine._tickPull();
+        expect(sentMessages(onSendToPeer).filter(m => m.type === 'pull_req')).toHaveLength(0);
+    });
+
+    it('pull without a watermark registers full-sync needs when the peer is ahead (outbound)', () => {
+        const onSendToPeer = vi.fn();
+        const { engine, db } = createEngine({ onSendToPeer });
+        engine.registerTable('users', { keyColumns: ['user_id'], dataColumns: ['user_id', 'name', '_hlc'] });
+        seedLog(db, 5);
+        connectAndHandshake(engine, { lastSeq: 9 });
+        // 握手本身已登记过一次 need；清掉后验证 tick 路径能独立登记
+        db._tables._full_sync_needs.length = 0;
+        onSendToPeer.mockClear();
+        engine._tickPull();
+        expect(sentMessages(onSendToPeer).filter(m => m.type === 'pull_req')).toHaveLength(0);
+        const needs = db._tables._full_sync_needs;
+        expect(needs.some(n => n.phase === 'rows' && n.table_name === 'users' && n.watermark_seq === 9)).toBe(true);
+        expect(needs.some(n => n.phase === 'tombstones' && n.watermark_seq === 9)).toBe(true);
+    });
+
+    it('pull without a watermark does nothing for inbound peers', () => {
+        const onSendToPeer = vi.fn();
+        const { engine, db } = createEngine({ onSendToPeer });
+        engine.registerTable('users', { keyColumns: ['user_id'], dataColumns: ['user_id', 'name', '_hlc'] });
+        seedLog(db, 5);
+        connectAndHandshake(engine, { direction: 'inbound', lastSeq: 9 });
+        db._tables._full_sync_needs.length = 0;
+        onSendToPeer.mockClear();
+        engine._tickPull();
+        expect(sentMessages(onSendToPeer).filter(m => m.type === 'pull_req')).toHaveLength(0);
+        expect(db._tables._full_sync_needs).toHaveLength(0);
+    });
+
+    it('push without a watermark starts from the peer-reported max seq, not 0', () => {
+        const onSendToPeer = vi.fn();
+        const { engine, db } = createEngine({ onSendToPeer });
+        seedLog(db, 6);
+        connectAndHandshake(engine, { lastSeq: 4 });
+        // 握手推送已建水位行；删掉它，模拟水位行被清理后的状态
+        db._tables._sync_peers.length = 0;
+        onSendToPeer.mockClear();
+        engine._pushToAllPeers();
+        const syncs = sentMessages(onSendToPeer).filter(m => m.type === 'sync');
+        expect(syncs).toHaveLength(1);
+        expect(syncs[0].entries.map(e => e.seq)).toEqual([5, 6]);
+        const row = db._tables._sync_peers.find(r => r.peer_key === 'remote-1');
+        expect(row?.last_sync_id).toBe(6);
+    });
+
+    it('push without a watermark and without a reported max seq sends nothing', () => {
+        const onSendToPeer = vi.fn();
+        const { engine, db } = createEngine({ onSendToPeer });
+        seedLog(db, 6);
+        connectAndHandshake(engine, {}); // handshake 不带 lastSeq
+        onSendToPeer.mockClear();
+        engine._pushToAllPeers();
+        expect(sentMessages(onSendToPeer).filter(m => m.type === 'sync')).toHaveLength(0);
     });
 });

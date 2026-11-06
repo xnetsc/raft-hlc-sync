@@ -1,6 +1,6 @@
 {
   "name": "@xnetx/raft-hlc-sync",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "pure javascript raft and hlc sync protocol",
   "keywords": [
     "raft",

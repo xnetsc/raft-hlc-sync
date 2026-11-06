@@ -245,6 +245,7 @@ export {
     computeUnclaimedFragments,
     // peer 操作
     getPeerLastSyncId,
+    getPeerWatermark,
     updatePeerSyncId,
     // 墓碑
     cleanTombstones,

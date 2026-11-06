@@ -154,6 +154,7 @@ import {
     cleanSyncLog,
     cleanTombstones,
     getPeerLastSyncId,
+    getPeerWatermark,
     updatePeerSyncId,
     scanTableRowsPage,
     scanTombstonesPage,
@@ -828,8 +829,21 @@ export class SyncEngine {
             const peer = this._peers.get(peerId);
             if (!peer?.nodeId) continue;
             try {
-                const lastSeq = getPeerLastSyncId(this.db, peer.nodeId);
-                this._sendToPeer(peerId, makePullRequest(lastSeq));
+                const watermark = getPeerWatermark(this.db, peer.nodeId);
+                if (watermark === null) {
+                    // 无水位记录（新对端，或水位行已被清理）：不从 0 拉取，
+                    // 改走与握手自检相同的最大序号比对——对端比我新且为
+                    // outbound 连接时登记全量同步 need；对端不比我新则无可
+                    // 拉取；对端最大序号未知（尚未收到其握手）时跳过本轮。
+                    if (peer.direction === 'outbound' && this._enableFullResync &&
+                        typeof peer.remoteMaxSeq === 'number' &&
+                        peer.remoteMaxSeq > getMaxSeq(this.db)) {
+                        this._registerFullSyncNeeds(peer.remoteMaxSeq);
+                        try { this._dispatchPendingNeeds(); } catch (_) { /* non-fatal */ }
+                    }
+                    continue;
+                }
+                this._sendToPeer(peerId, makePullRequest(watermark));
             } catch (err) {
                 this._onError('pull', err);
             }
@@ -867,6 +881,10 @@ export class SyncEngine {
             nodeId: null,
             direction,
             lastActivity: this._nowMs(),
+            // 对端在握手时报告的最大序号 / 最小日志 id（收到握手后填入）。
+            // 水位行缺失时，定时拉/推以 remoteMaxSeq 为比对基准，不回退到 0。
+            remoteMaxSeq: null,
+            remoteMinLogId: null,
         });
         this._timeSyncStates.set(peerId, {
             seq: 0,
@@ -1558,11 +1576,27 @@ export class SyncEngine {
 
     // ---- 消息处理 ----
 
+    /**
+     * 登记覆盖全部业务表 + tombstones 的全量同步 need（scope=(-∞,+∞]，
+     * watermark=peerLastSeq）。握手自检与 _tickPull 缺水位比对共用。
+     * @param {number} peerLastSeq - 对端报告的最大序号
+     */
+    _registerFullSyncNeeds(peerLastSeq) {
+        upsertFullSyncNeed(this.db, 'tombstones', null, peerLastSeq, this._getNow);
+        for (const [tableName] of this._tableRegistry.entries()) {
+            upsertFullSyncNeed(this.db, 'rows', tableName, peerLastSeq, this._getNow);
+        }
+    }
+
     _handleHandshake(peerId, msg) {
         const remoteNodeId = msg.nodeId;
         const peer = this._peers.get(peerId);
         if (!peer) return;
         peer.nodeId = remoteNodeId;
+        // 保留对端报告的最大序号 / 最小日志 id：水位行缺失时，定时拉/推
+        // 以此为比对基准（见 _tickPull / _pushToAllPeers），不回退到 0。
+        if (typeof msg.lastSeq === 'number') peer.remoteMaxSeq = msg.lastSeq;
+        if (typeof msg.minLogId === 'number') peer.remoteMinLogId = msg.minLogId;
 
         // 去重
         const existingPeerId = this._nodeIdToPeerId.get(remoteNodeId);
@@ -1612,10 +1646,7 @@ export class SyncEngine {
                 const peerLastSeq = msg.lastSeq || 0;
                 const localMaxSeq = getMaxSeq(this.db);
                 if (peerLastSeq > localMaxSeq) {
-                    upsertFullSyncNeed(this.db, 'tombstones', null, peerLastSeq, this._getNow);
-                    for (const [tableName] of this._tableRegistry.entries()) {
-                        upsertFullSyncNeed(this.db, 'rows', tableName, peerLastSeq, this._getNow);
-                    }
+                    this._registerFullSyncNeeds(peerLastSeq);
                 }
             }
         } catch (err) {
@@ -2107,7 +2138,14 @@ export class SyncEngine {
             const peer = this._peers.get(peerId);
             if (!peer?.nodeId) continue;
             try {
-                const lastSeq = getPeerLastSyncId(this.db, peer.nodeId);
+                let lastSeq = getPeerWatermark(this.db, peer.nodeId);
+                if (lastSeq === null) {
+                    // 无水位记录：不从 0 重放，改以对端握手时报告的最大序号
+                    // 为基准——只推它报告位置之后的增量；基准未知（尚未收到
+                    // 其握手）时跳过本轮，等握手路径处理。
+                    if (typeof peer.remoteMaxSeq !== 'number') continue;
+                    lastSeq = peer.remoteMaxSeq;
+                }
                 const entries = readSyncLog(this.db, lastSeq, this._syncBatchSize);
                 if (entries.length === 0) continue;
                 this._sendToPeer(peerId, makeSync(entries));

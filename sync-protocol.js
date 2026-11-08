@@ -518,6 +518,32 @@ export function updatePeerSyncId(db, peerKey, lastSyncId, getNow) {
     db.run(db.upsertSQL('_sync_peers', cols, keys), [peerKey, lastSyncId, new Date(nowMs).toISOString()]);
 }
 
+/**
+ * 读取本节点对某 peer 日志的消费偏移（pull offset）：已确认收到该 peer
+ * _sync_log 到哪个序号（对方序号空间）。与 _sync_peers.last_sync_id
+ * （对方消费本节点日志的进度，push 方向，本节点序号空间）是两个独立
+ * 语义，分别记录、互不借用——混用会让 pull 请求跳过从未收到过的条目，
+ * 在非全连接拓扑上形成静默的数据缺口。
+ * 无记录返回 null（尚未与该 peer 建立增量拉取关系）。
+ */
+export function getPeerPullOffset(db, peerKey) {
+    const row = db.get('SELECT last_pulled_seq FROM _sync_pull_offsets WHERE peer_key = ?', [peerKey]);
+    return row ? row.last_pulled_seq : null;
+}
+
+/**
+ * 推进 pull offset（单调，只增不减）：乱序到达的批次不得把偏移拉回去。
+ * 调用方须保证推进不越过未收到的条目（连续性由引擎的推进点保证）。
+ */
+export function updatePeerPullOffset(db, peerKey, lastPulledSeq, getNow) {
+    const cur = getPeerPullOffset(db, peerKey);
+    if (cur !== null && lastPulledSeq <= cur) return;
+    const cols = ['peer_key', 'last_pulled_seq', 'last_sync_at'];
+    const keys = ['peer_key'];
+    const nowMs = timeValueToMs(getNow());
+    db.run(db.upsertSQL('_sync_pull_offsets', cols, keys), [peerKey, lastPulledSeq, new Date(nowMs).toISOString()]);
+}
+
 // ╔═══════════════════════════════════════╗
 // ║             墓碑清理                   ║
 // ╚═══════════════════════════════════════╝

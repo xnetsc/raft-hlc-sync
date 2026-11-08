@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SyncEngine } from './sync-engine.js';
-import { getPeerWatermark } from './sync-protocol.js';
+import { getPeerWatermark, getPeerPullOffset } from './sync-protocol.js';
 
 // ═══════════════════════════════════════════════════
 //  Helpers
@@ -34,7 +34,7 @@ function createInMemoryDb(opts = {}) {
         run(sql, params = []) {
             // Generic business-table INSERT OR REPLACE
             const upsertMatch = sql.match(/^INSERT OR REPLACE INTO (\w+) \(([^)]+)\) VALUES/);
-            if (upsertMatch && !['_sync_log', '_sync_peers', '_tombstones'].includes(upsertMatch[1])) {
+            if (upsertMatch && !['_sync_log', '_sync_peers', '_sync_pull_offsets', '_tombstones'].includes(upsertMatch[1])) {
                 const tbl = upsertMatch[1];
                 const cols = upsertMatch[2].split(',').map(s => s.trim());
                 const keyCols = tableKeys[tbl];
@@ -66,6 +66,13 @@ function createInMemoryDb(opts = {}) {
                 const t = getTable('_sync_peers');
                 const idx = t.findIndex(r => r.peer_key === params[0]);
                 const row = { peer_key: params[0], last_sync_id: params[1], last_sync_at: params[2] };
+                if (idx >= 0) t[idx] = row; else t.push(row);
+                return { changes: 1 };
+            }
+            if (sql.startsWith('INSERT OR REPLACE') && sql.includes('_sync_pull_offsets')) {
+                const t = getTable('_sync_pull_offsets');
+                const idx = t.findIndex(r => r.peer_key === params[0]);
+                const row = { peer_key: params[0], last_pulled_seq: params[1], last_sync_at: params[2] };
                 if (idx >= 0) t[idx] = row; else t.push(row);
                 return { changes: 1 };
             }
@@ -185,6 +192,11 @@ function createInMemoryDb(opts = {}) {
                 const t = getTable('_sync_peers');
                 const row = t.find(r => r.peer_key === params[0]);
                 return row ? { last_sync_id: row.last_sync_id } : null;
+            }
+            if (sql.includes('last_pulled_seq') && sql.includes('_sync_pull_offsets')) {
+                const t = getTable('_sync_pull_offsets');
+                const row = t.find(r => r.peer_key === params[0]);
+                return row ? { last_pulled_seq: row.last_pulled_seq } : null;
             }
             if (sql.includes('_hlc FROM _tombstones')) {
                 const t = getTable('_tombstones');
@@ -2100,16 +2112,28 @@ describe('SyncEngine missing peer watermark', () => {
         expect(getPeerWatermark(db, 'zero')).toBe(0);
     });
 
-    it('pull with an existing watermark sends pull_req from that watermark', () => {
+    it('pull with an existing pull offset sends pull_req from that offset', () => {
         const onSendToPeer = vi.fn();
         const { engine, db } = createEngine({ onSendToPeer });
-        db._tables._sync_peers = [{ peer_key: 'remote-1', last_sync_id: 7, last_sync_at: null }];
+        db._tables._sync_pull_offsets = [{ peer_key: 'remote-1', last_pulled_seq: 7, last_sync_at: null }];
         connectAndHandshake(engine, { lastSeq: 0 });
         onSendToPeer.mockClear();
         engine._tickPull();
         const pulls = sentMessages(onSendToPeer).filter(m => m.type === 'pull_req');
         expect(pulls).toHaveLength(1);
         expect(pulls[0].sinceSeq).toBe(7);
+    });
+
+    it('pull ignores the push watermark (separate seq space)', () => {
+        // _sync_peers.last_sync_id 是 push 进度（本节点序号空间），
+        // 绝不能被当作 pull 偏移使用——即使它存在，pull 也只认 pull offset
+        const onSendToPeer = vi.fn();
+        const { engine, db } = createEngine({ onSendToPeer });
+        db._tables._sync_peers = [{ peer_key: 'remote-1', last_sync_id: 7, last_sync_at: null }];
+        connectAndHandshake(engine, { lastSeq: 0 });
+        onSendToPeer.mockClear();
+        engine._tickPull();
+        expect(sentMessages(onSendToPeer).filter(m => m.type === 'pull_req')).toHaveLength(0);
     });
 
     it('pull without a watermark does not replay from 0 when the peer is not ahead', () => {
@@ -2163,6 +2187,10 @@ describe('SyncEngine missing peer watermark', () => {
         const syncs = sentMessages(onSendToPeer).filter(m => m.type === 'sync');
         expect(syncs).toHaveLength(1);
         expect(syncs[0].entries.map(e => e.seq)).toEqual([5, 6]);
+        // 发送本身不推进 push 水位：水位只由接收方 ack 推进，
+        // 否则接收方未落地的批次会被永久跳过
+        expect(db._tables._sync_peers.find(r => r.peer_key === 'remote-1')).toBeUndefined();
+        engine.receiveMessage('p1', JSON.stringify({ type: 'ack', lastSeq: 6 }));
         const row = db._tables._sync_peers.find(r => r.peer_key === 'remote-1');
         expect(row?.last_sync_id).toBe(6);
     });
@@ -2175,5 +2203,72 @@ describe('SyncEngine missing peer watermark', () => {
         onSendToPeer.mockClear();
         engine._pushToAllPeers();
         expect(sentMessages(onSendToPeer).filter(m => m.type === 'sync')).toHaveLength(0);
+    });
+});
+
+// ═══════════════════════════════════════════════════
+//  Pull offset: split from the push watermark
+//  （pull 偏移只由实际收到的条目连续推进；收到数据不虚增 push 进度）
+// ═══════════════════════════════════════════════════
+
+describe('SyncEngine pull offset', () => {
+    const ts = (wt, c = 0) => `${String(wt).padStart(15, '0')}.${String(c).padStart(5, '0')}.remote-1`;
+    const entry = (seq, userId, wt) => ({
+        seq, table_name: 'users', operation: 'INSERT',
+        row_key: JSON.stringify({ user_id: userId }),
+        row_data: JSON.stringify({ user_id: userId, name: 'N-' + userId, _hlc: ts(wt) }),
+        _hlc: ts(wt),
+    });
+    function setup(onSendToPeer = vi.fn()) {
+        const { engine, db } = createEngine({ onSendToPeer });
+        db._tableKeys.users = ['user_id']; // 让 fake 的通用 upsert 分支能落 users 行
+        engine.registerTable('users', { keyColumns: ['user_id'], dataColumns: ['user_id', 'name', '_hlc'] });
+        engine.start();
+        engine.peerConnected('p1', { direction: 'outbound' });
+        engine.receiveMessage('p1', JSON.stringify({ type: 'handshake', nodeId: 'remote-1', lastSeq: 0 }));
+        return { engine, db };
+    }
+    const sendSync = (engine, entries) =>
+        engine.receiveMessage('p1', JSON.stringify({ type: 'sync', entries }));
+
+    it('receiving a sync batch advances the pull offset and leaves the push watermark untouched', () => {
+        const { engine, db } = setup();
+        sendSync(engine, [entry(1, 'a', 2000), entry(2, 'b', 2001), entry(3, 'c', 2002)]);
+        expect(getPeerPullOffset(db, 'remote-1')).toBe(3);
+        // 收到对方数据 ≠ 对方已消费本节点日志：push 进度不得被虚增
+        expect(getPeerWatermark(db, 'remote-1')).toBe(null);
+    });
+
+    it('a gapped first batch applies its data but does not create a pull offset', () => {
+        const { engine, db } = setup();
+        sendSync(engine, [entry(5, 'e', 2004), entry(6, 'f', 2005)]);
+        expect(getPeerPullOffset(db, 'remote-1')).toBe(null);
+        const row = db._tables.users?.find(r => r.user_id === 'e');
+        expect(row).toBeTruthy();
+    });
+
+    it('the pull offset advances only across contiguous batches', () => {
+        const { engine, db } = setup();
+        sendSync(engine, [entry(1, 'a', 2000), entry(2, 'b', 2001)]);
+        expect(getPeerPullOffset(db, 'remote-1')).toBe(2);
+        sendSync(engine, [entry(5, 'e', 2004)]); // 缺口 3..4：不越过
+        expect(getPeerPullOffset(db, 'remote-1')).toBe(2);
+        sendSync(engine, [entry(3, 'c', 2002), entry(4, 'd', 2003), entry(5, 'e', 2004)]);
+        expect(getPeerPullOffset(db, 'remote-1')).toBe(5);
+    });
+
+    it('a committed 2PC prepare advances the pull offset; an aborted one does not', () => {
+        const onSendToPeer = vi.fn();
+        const { engine, db } = setup(onSendToPeer);
+        const entries = [entry(1, 'a', 2000), entry(2, 'b', 2001)];
+        engine.receiveMessage('p1', JSON.stringify({ type: 'prepare', writeId: 'w1', entries, term: 1, shardId: 0 }));
+        expect(getPeerPullOffset(db, 'remote-1')).toBe(null); // 暂存阶段不推进
+        engine.receiveMessage('p1', JSON.stringify({ type: 'commit', writeId: 'w1' }));
+        expect(getPeerPullOffset(db, 'remote-1')).toBe(2);
+
+        const entries2 = [entry(3, 'c', 2002)];
+        engine.receiveMessage('p1', JSON.stringify({ type: 'prepare', writeId: 'w2', entries: entries2, term: 1, shardId: 0 }));
+        engine.receiveMessage('p1', JSON.stringify({ type: 'abort', writeId: 'w2' }));
+        expect(getPeerPullOffset(db, 'remote-1')).toBe(2);
     });
 });

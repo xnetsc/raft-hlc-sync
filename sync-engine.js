@@ -156,6 +156,8 @@ import {
     getPeerLastSyncId,
     getPeerWatermark,
     updatePeerSyncId,
+    getPeerPullOffset,
+    updatePeerPullOffset,
     scanTableRowsPage,
     scanTombstonesPage,
     applyFullSyncRows,
@@ -829,9 +831,12 @@ export class SyncEngine {
             const peer = this._peers.get(peerId);
             if (!peer?.nodeId) continue;
             try {
-                const watermark = getPeerWatermark(this.db, peer.nodeId);
-                if (watermark === null) {
-                    // 无水位记录（新对端，或水位行已被清理）：不从 0 拉取，
+                // pull 偏移是本节点对该 peer 日志的消费进度（对方序号空间），
+                // 只由实际收到条目的路径推进（_advancePullOffset）；与
+                // _sync_peers 的 push 进度（本节点序号空间）严格分开。
+                const pullOffset = getPeerPullOffset(this.db, peer.nodeId);
+                if (pullOffset === null) {
+                    // 无拉取记录（新对端，或记录已被清理）：不从 0 拉取，
                     // 改走与握手自检相同的最大序号比对——对端比我新且为
                     // outbound 连接时登记全量同步 need；对端不比我新则无可
                     // 拉取；对端最大序号未知（尚未收到其握手）时跳过本轮。
@@ -843,7 +848,7 @@ export class SyncEngine {
                     }
                     continue;
                 }
-                this._sendToPeer(peerId, makePullRequest(watermark));
+                this._sendToPeer(peerId, makePullRequest(pullOffset));
             } catch (err) {
                 this._onError('pull', err);
             }
@@ -1745,6 +1750,29 @@ export class SyncEngine {
         }
     }
 
+    /**
+     * 推进本节点对某 peer 日志的消费偏移（pull offset，对方序号空间）。
+     * 只允许连续推进：批次首序号必须接得上当前偏移（或从 1 开始），
+     * 否则说明中间还有没收到的条目——本批数据照常应用，但偏移不越过
+     * 缺口，缺口留给后续 pull 按偏移补齐。无记录且批次不从 1 开始时
+     * 同样不建偏移（走全量同步/推送路径兜底）。
+     */
+    _advancePullOffset(peerNodeId, firstSeq, lastSeq) {
+        if (!peerNodeId || typeof firstSeq !== 'number' || typeof lastSeq !== 'number') return;
+        try {
+            const cur = getPeerPullOffset(this.db, peerNodeId);
+            if (cur === null) {
+                if (firstSeq <= 1) updatePeerPullOffset(this.db, peerNodeId, lastSeq, this._getNow);
+                return;
+            }
+            if (firstSeq <= cur + 1 && lastSeq > cur) {
+                updatePeerPullOffset(this.db, peerNodeId, lastSeq, this._getNow);
+            }
+        } catch (err) {
+            this._onError('pull_offset', err);
+        }
+    }
+
     _handleSync(peerId, msg) {
         if (!msg.entries || msg.entries.length === 0) return;
         const peer = this._peers.get(peerId);
@@ -1753,12 +1781,21 @@ export class SyncEngine {
             const result = applyEntries(this.db, msg.entries, this.hlc, this._tableRegistry, this._applyEntriesOpts());
 
             const maxSeq = msg.entries[msg.entries.length - 1].seq;
-            this._sendToPeer(peerId, makeAck(maxSeq));
+
+            // 收到并处理完这批条目 → 推进对该 peer 的 pull 偏移。
+            // 注意：不得在此更新 _sync_peers 的 push 进度——收到对方
+            // 数据不等于对方已消费本节点日志，虚增会让 push 跳过缺口。
+            if (peer?.nodeId) {
+                this._advancePullOffset(peer.nodeId, msg.entries[0].seq, maxSeq);
+            }
+
+            // ack 报告本节点对发送方日志的连续消费偏移（而非本批最大
+            // 序号）：发送方据此推进 push 水位，未被连续消费的条目会
+            // 被重发，不会因乱序/缺口批次的 ack 被跳过。
+            const consumed = peer?.nodeId ? (getPeerPullOffset(this.db, peer.nodeId) ?? 0) : maxSeq;
+            this._sendToPeer(peerId, makeAck(consumed));
 
             if (result.applied > 0) {
-                if (peer?.nodeId) {
-                    updatePeerSyncId(this.db, peer.nodeId, getMaxSeq(this.db), this._getNow);
-                }
                 this._onWriteCompleted();
             }
         } catch (err) {
@@ -2083,7 +2120,13 @@ export class SyncEngine {
                 try { this.db.rollback(); } catch (_) {}
             }, this._followerTxnTimeoutMs);
 
-            this._followerTxns.set(writeId, { timeoutHandle, peerId });
+            this._followerTxns.set(writeId, {
+                timeoutHandle, peerId,
+                // 暂存条目在 leader 日志中的序号区间，commit 落地后据此
+                // 推进对 leader 的 pull 偏移（prepare 阶段不推进：可能 abort）
+                firstSeq: entries[0]?.seq,
+                lastSeq: entries[entries.length - 1]?.seq,
+            });
             this._sendToPeer(peerId, makePrepareAck(writeId, true, null));
         } catch (err) {
             try { this.db.rollback(); } catch (_) {}
@@ -2116,6 +2159,9 @@ export class SyncEngine {
         this._followerTxns.delete(msg.writeId);
         try {
             this.db.commit();
+            // 暂存条目已正式落地 → 计入对 leader 日志的消费偏移
+            const leaderNodeId = txn.peerId ? this._peers.get(txn.peerId)?.nodeId : null;
+            this._advancePullOffset(leaderNodeId, txn.firstSeq, txn.lastSeq);
             this._onWriteCompleted();
         } catch (err) {
             this._onError('2pc_commit', err);
@@ -2149,7 +2195,9 @@ export class SyncEngine {
                 const entries = readSyncLog(this.db, lastSeq, this._syncBatchSize);
                 if (entries.length === 0) continue;
                 this._sendToPeer(peerId, makeSync(entries));
-                updatePeerSyncId(this.db, peer.nodeId, entries[entries.length - 1].seq, this._getNow);
+                // 发送后不推进 push 水位：水位只由接收方的 ack 推进
+                // （ack 报告其连续消费偏移）。发送即推进会让接收方未能
+                // 落地的批次（单连接事务冲突等）永远不再重发，形成缺口。
             } catch (err) {
                 this._onError('push', err);
             }

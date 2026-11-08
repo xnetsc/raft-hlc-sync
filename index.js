@@ -247,6 +247,8 @@ export {
     getPeerLastSyncId,
     getPeerWatermark,
     updatePeerSyncId,
+    getPeerPullOffset,
+    updatePeerPullOffset,
     // 墓碑
     cleanTombstones,
 } from './sync-protocol.js';

@@ -8,6 +8,7 @@ import {
     applyEntries, applyEntriesInTransaction,
     readSyncLog, getMaxSeq, cleanSyncLog,
     getPeerLastSyncId, updatePeerSyncId,
+    getPeerPullOffset, updatePeerPullOffset,
     cleanTombstones, logChange,
 } from './sync-protocol.js';
 import { HLC } from './hlc.js';
@@ -40,6 +41,13 @@ function createMockDb() {
                 const t = getTable('_sync_peers');
                 const idx = t.findIndex(r => r.peer_key === params[0]);
                 const row = { peer_key: params[0], last_sync_id: params[1], last_sync_at: params[2] };
+                if (idx >= 0) t[idx] = row; else t.push(row);
+                return { changes: 1 };
+            }
+            if (sql.startsWith('INSERT OR REPLACE') && sql.includes('_sync_pull_offsets')) {
+                const t = getTable('_sync_pull_offsets');
+                const idx = t.findIndex(r => r.peer_key === params[0]);
+                const row = { peer_key: params[0], last_pulled_seq: params[1], last_sync_at: params[2] };
                 if (idx >= 0) t[idx] = row; else t.push(row);
                 return { changes: 1 };
             }
@@ -95,6 +103,11 @@ function createMockDb() {
                 const t = getTable('_sync_peers');
                 const row = t.find(r => r.peer_key === params[0]);
                 return row ? { last_sync_id: row.last_sync_id } : null;
+            }
+            if (sql.includes('last_pulled_seq') && sql.includes('_sync_pull_offsets')) {
+                const t = getTable('_sync_pull_offsets');
+                const row = t.find(r => r.peer_key === params[0]);
+                return row ? { last_pulled_seq: row.last_pulled_seq } : null;
             }
             if (sql.includes('_hlc FROM _tombstones')) {
                 const t = getTable('_tombstones');
@@ -313,6 +326,23 @@ describe('Peer sync operations', () => {
         updatePeerSyncId(db, 'peer-1', 1, getNow);
         const row = db._tables._sync_peers[0];
         expect(row.last_sync_at).toMatch(/^\d{4}-\d{2}-\d{2}T/); // ISO format
+    });
+
+    it('getPeerPullOffset returns null for an unknown peer (distinct from 0)', () => {
+        expect(getPeerPullOffset(createMockDb(), 'unknown')).toBe(null);
+    });
+
+    it('updatePeerPullOffset stores, retrieves, and never moves backwards', () => {
+        const db = createMockDb();
+        const getNow = () => ({ value: 1713000000000, unit: 'ms' });
+        updatePeerPullOffset(db, 'peer-1', 10, getNow);
+        expect(getPeerPullOffset(db, 'peer-1')).toBe(10);
+        updatePeerPullOffset(db, 'peer-1', 7, getNow); // 乱序批次不得拉回偏移
+        expect(getPeerPullOffset(db, 'peer-1')).toBe(10);
+        updatePeerPullOffset(db, 'peer-1', 12, getNow);
+        expect(getPeerPullOffset(db, 'peer-1')).toBe(12);
+        // 与 push 进度互相独立
+        expect(getPeerLastSyncId(db, 'peer-1')).toBe(0);
     });
 
     it('updatePeerSyncId works with seconds unit', () => {

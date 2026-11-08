@@ -50,6 +50,12 @@ const SQLITE = {
     last_sync_at TEXT,
     PRIMARY KEY (peer_key)
 )`,
+            `CREATE TABLE IF NOT EXISTS _sync_pull_offsets (
+    peer_key TEXT NOT NULL,
+    last_pulled_seq INTEGER NOT NULL DEFAULT 0,
+    last_sync_at TEXT,
+    PRIMARY KEY (peer_key)
+)`,
             `CREATE TABLE IF NOT EXISTS _tombstones (
     table_name TEXT NOT NULL,
     row_key TEXT NOT NULL,
@@ -213,6 +219,11 @@ const POSTGRESQL = {
                 last_sync_id BIGINT DEFAULT 0,
                 last_sync_at TIMESTAMPTZ
             )`,
+            `CREATE TABLE IF NOT EXISTS _sync_pull_offsets (
+                peer_key TEXT PRIMARY KEY,
+                last_pulled_seq BIGINT DEFAULT 0,
+                last_sync_at TIMESTAMPTZ
+            )`,
             `CREATE TABLE IF NOT EXISTS _tombstones (
                 table_name TEXT NOT NULL,
                 row_key TEXT NOT NULL,
@@ -359,6 +370,11 @@ const MYSQL = {
             `CREATE TABLE IF NOT EXISTS _sync_peers (
                 peer_key VARCHAR(255) PRIMARY KEY,
                 last_sync_id BIGINT DEFAULT 0,
+                last_sync_at DATETIME
+            )`,
+            `CREATE TABLE IF NOT EXISTS _sync_pull_offsets (
+                peer_key VARCHAR(255) PRIMARY KEY,
+                last_pulled_seq BIGINT DEFAULT 0,
                 last_sync_at DATETIME
             )`,
             `CREATE TABLE IF NOT EXISTS _tombstones (

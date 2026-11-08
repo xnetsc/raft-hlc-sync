@@ -1500,6 +1500,37 @@ describe('SyncEngine manual transaction', () => {
         expect(() => engine.commitManualTransaction('wrong')).toThrow('No active manual transaction');
         engine.rollbackManualTransaction('txn-1');
     });
+
+    it('write() joins an active manual transaction instead of opening its own', async () => {
+        const { engine } = createEngine();
+        engine.beginManualTransaction('outer-1');
+        const result = await engine.write(async () => 'joined-result');
+        expect(result).toBe('joined-result');
+        // 事务仍归外层持有：未被 write() 提前提交/关闭，外层 writeId 仍可提交
+        expect(engine.hasActiveManualTransaction()).toBe(true);
+        engine.commitManualTransaction('outer-1');
+        expect(engine.hasActiveManualTransaction()).toBe(false);
+    });
+
+    it('write() nested inside write() joins the outer write transaction', async () => {
+        const { engine } = createEngine();
+        const result = await engine.write(async () => {
+            const inner = await engine.write(async () => 'inner-result');
+            return inner;
+        });
+        expect(result).toBe('inner-result');
+        expect(engine.hasActiveManualTransaction()).toBe(false);
+    });
+
+    it('standalone write() still works after a joined write and manual commit', async () => {
+        const { engine } = createEngine();
+        engine.beginManualTransaction('outer-1');
+        await engine.write(async () => {});
+        engine.commitManualTransaction('outer-1');
+        const result = await engine.write(async () => 'standalone-result');
+        expect(result).toBe('standalone-result');
+        expect(engine.hasActiveManualTransaction()).toBe(false);
+    });
 });
 
 // ═══════════════════════════════════════════════════

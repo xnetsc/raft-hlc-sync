@@ -45,13 +45,18 @@
  *   "在线"；若它对 X 在世的认知也是问别人问来的，只能回中间结论
  *   "在线，但是我是问的别人"，不许把二手结论放大成明确结论；若它
  *   自己也正在问的过程中（还没有结论），回"不确定"。回复一共四种：
- *   在线 / 在线，但是我是问的别人 / 不在线了 / 不确定。收结论方只认
- *   第一种：任一节点给出明确"在线"即停问、刷新 leader 存活时间，
- *   本轮结束——单个节点连不上 leader、但同组节点仍能听到 leader 时，
- *   它涨不了 term、全网不换届；其余三种回复与超时未回一律不算数，
- *   全部问完仍无明确"在线"就直接进入正式选举，不再另设预投票一轮。
+ *   在线 / 在线，但是我是问的别人 / 不在线了 / 不确定。收结论按多数
+ *   决：只认第一种，且被问的人里严格过半回明确"在线"，才认为 leader
+ *   在线——停问、刷新 leader 存活时间，本轮结束；达不到过半（或剩余
+ *   人全回"在线"也凑不够过半）就直接发起投票，不再另设预投票一轮。
+ *   只靠一两个节点回"在线"、其余全断开时若也算数，这个节点将永远
+ *   无法重选，而此刻集群可用性其实已经极低——故必须以过半为准。
+ *   单个节点连不上 leader、但同组过半节点仍能听到 leader 时，它涨
+ *   不了 term、全网不换届；其余三种回复与超时未回一律不算"在线"。
  *   问询期间直连恢复（leader 心跳到达，或原 leader 的传输连接重连）
- *   同样即时停问。
+ *   同样即时停问；一旦收到选举信息（vote_req 或本人参选），问询两个
+ *   方向全停：问到一半的立即停问、参与选举；被问的也不再作答，直到
+ *   新 leader 经心跳确立——选举已经在进行，问与被问都没有意义了。
  *
  * 外部需注册的回调接口：
  *   onSendHeartbeat(shardId, term, leaderId)
@@ -169,10 +174,14 @@ export class LeaderElection {
         this._lastLeaderHeartbeatAt = 0;
         /** 上次经存活问询确认现任 leader 在世的时刻（ms）：一次性证据 */
         this._lastRelayedHeartbeatAt = 0;
-        /** 进行中的存活问询：{ queryId, queue:Array, current, timer, targetLeaderId } | null（顺序问询，一次一问） */
+        /** 进行中的存活问询：{ queryId, queue, current, timer, targetLeaderId, targetSet, totalTargets, requiredOnline, responded, pendingLate, onlineCounts, onlineTerms } | null（顺序问询，一次一问） */
         this._inquiry = null;
         /** 问询编号计数（本实例内单调递增，应答按编号对号） */
         this._inquirySeq = 0;
+        /** 已收到选举信息（vote_req 或本人参选）的最高 term；该 term 的
+         *  leader 经心跳确立前，问询两个方向都停：不问、也不答。
+         *  0 表示无未决选举 */
+        this._electionNoticeTerm = 0;
 
         this._cachedQuorum = 1;
         this._connectedNodeIds = new Set();
@@ -261,11 +270,21 @@ export class LeaderElection {
 
         // leader 确实活着：问询失去意义，重置计时器
         this._cancelInquiry();
+        // 本 term 的 leader 已经确立：未决选举结束，被问恢复作答
+        if (term >= this._electionNoticeTerm) this._electionNoticeTerm = 0;
         if (this._state !== 'leader') this._resetElectionTimer();
     }
 
     receiveVoteReq(term, candidateId, priority) {
         if (!this._started) return;
+        // 问询途中收到选举信息：立即停问，参与选举。别人已经发起选举，
+        // 再问"旧 leader 还在不在"没有意义——本票按下面的正常投票流程
+        // 处理。停问后若本票未投出（term 旧、或本 term 已投他人），
+        // 重置选举计时器，免得节点悬空：到期后它会重新问询/参选。
+        const hadInquiry = !!this._inquiry;
+        if (hadInquiry) this._cancelInquiry();
+        // 记下"本 term 已有选举在进行"：新 leader 确立前，被问也不再作答
+        if (term >= this._currentTerm) this._electionNoticeTerm = term;
         if (term > this._currentTerm) this._stepDown(term);
 
         let granted = false;
@@ -283,6 +302,7 @@ export class LeaderElection {
                 this._resetElectionTimer();
             }
         }
+        if (!granted && hadInquiry) this._resetElectionTimer();
 
         this._onSendVoteAck(this.shardId, term, candidateId, granted);
     }
@@ -305,7 +325,11 @@ export class LeaderElection {
      * 收到存活问询：问方带了目标 leader 的 id——"我们共同的 leader 是
      * X，X 还在不在"。只就 X 作答，不改变本节点任何状态；问方没点名
      * （它自己也没有 leader 视图）时，就答本节点所知的 leader。
-     * 回复只有三种，且必须来自本节点自己的直连结论：
+     * 但本节点若已收到选举信息（本 term 的 vote_req 或本人参选）、且
+     * 新 leader 尚未经心跳确立，则不作答（直接丢弃）：选举已经在进行，
+     * 再给旧 leader 的存活背书没有意义（在任 leader 本人除外，它给
+     * 自己作答永远有效）。
+     * 回复一共四种，且必须来自本节点自己的直连结论：
      *   'online'（在线）——本节点就是 X，或在最小选举超时内收到过
      *     X 的直连心跳：据直连心跳给的结论；
      *   'online_indirect'（在线，但是我是问的别人）——本节点对 X 在世
@@ -320,6 +344,9 @@ export class LeaderElection {
      */
     receiveLeaderQuery(queryId, askerId, targetLeaderId) {
         if (!this._started) return;
+        // 已收到选举信息、本 term 的新 leader 未确立：被问也不答
+        if (this._state !== 'leader' && this._electionNoticeTerm > 0 &&
+            this._electionNoticeTerm >= this._currentTerm) return;
         const subject = targetLeaderId ?? this._currentLeaderNodeId;
         let verdict = 'offline';
         if (subject !== null) {
@@ -342,27 +369,43 @@ export class LeaderElection {
     }
 
     /**
-     * 收到问询应答。收结论的规矩只有一条：必须收到明确的"在线"
-     *（verdict='online'，且所指 leader 就是本节点所问的那个——或本
-     * 节点尚无 leader 视图、或对方 term 更高），才终结问询、保持正常，
-     * 按该证据刷新存活时间（注意：本节点由此得到的证据是问来的，之后
-     * 被别人问到时只能报"在线，但是我是问的别人"）。'online_indirect'、
-     * 'offline'、'uncertain' 一律不算明确结论：当前被问者如此回答就问下一个；
-     * 迟到的明确"在线"同样作数。全部问完仍无明确"在线" → 直接正式
-     * 选举。
+     * 收到问询应答。收结论按多数决：只认明确的"在线"（verdict=
+     * 'online'），且要被问的人里严格过半都回"在线"指向同一个 leader，
+     * 才终结问询、保持正常，按该证据刷新存活时间（注意：本节点由此
+     * 得到的证据是问来的，之后被别人问到时只能报"在线，但是我是问
+     * 的别人"）。'online_indirect'、'offline'、'uncertain'、超时未回
+     * 一律不算"在线"。迟到的"在线"同样计票（同一应答者只计一次）；
+     * 过半在中途达成即停问，剩余人全回"在线"也凑不够过半时提前收场，
+     * 两种情况都不必问完。达不到过半 → 发起投票（正式选举）。
+     * 指向的 leader 须与所问目标一致（问方无目标时以票多者为准；
+     * 或对方 term 更高），别域同 term 的 leader 不算数。
      */
     receiveLeaderQueryAck(queryId, verdict, leaderId, term, responderId) {
         if (!this._started) return;
         const inq = this._inquiry;
         if (!inq || queryId !== inq.queryId) return;
+        if (!inq.targetSet.has(responderId) || inq.responded.has(responderId)) {
+            // 目标集外的人、或同一人的重复应答：不计票；若是当前被问者
+            // 的重复应答（协议上不应出现），也不推进顺序。
+            return;
+        }
+        inq.responded.add(responderId);
+        inq.pendingLate.delete(responderId);
         if (verdict === 'online' && leaderId) {
-            const decisive = this._currentLeaderNodeId === null ||
-                leaderId === this._currentLeaderNodeId || term > this._currentTerm;
-            if (decisive) {
-                this._cancelInquiry();
-                this.receiveHeartbeat(term, leaderId, { relayed: true });
-                if (this._state !== 'leader') this._resetElectionTimer();
-                return;
+            const count = (inq.onlineCounts.get(leaderId) || 0) + 1;
+            inq.onlineCounts.set(leaderId, count);
+            const bestTerm = Math.max(inq.onlineTerms.get(leaderId) || 0, term);
+            inq.onlineTerms.set(leaderId, bestTerm);
+            if (count >= inq.requiredOnline) {
+                const eligible = inq.targetLeaderId === null ||
+                    leaderId === inq.targetLeaderId ||
+                    leaderId === this._currentLeaderNodeId || bestTerm > this._currentTerm;
+                if (eligible) {
+                    this._cancelInquiry();
+                    this.receiveHeartbeat(bestTerm, leaderId, { relayed: true });
+                    if (this._state !== 'leader') this._resetElectionTimer();
+                    return;
+                }
             }
         }
         if (responderId === inq.current) this._askNext();
@@ -371,8 +414,9 @@ export class LeaderElection {
     /**
      * 心跳超时后的入口：逐个问直连节点 leader 在不在。
      * 顺序问询：一次只问一个；对方答非明确"在线"、或在动态超时内没回，
-     * 才问下一个；出现决定性确认立即停问。全部问完无人能确认，
-     * 直接正式选举。任何时刻至多一问在途，不产生并发泛洪。
+     * 才问下一个；被问者中严格过半回明确"在线"即停问。达不到过半，
+     * 或剩余人全回"在线"也凑不够过半，就发起投票（正式选举）。
+     * 任何时刻至多一问在途，不产生并发泛洪。
      * 问询期间直连恢复同样即时停问：leader 心跳到达（receiveHeartbeat），
      * 或原 leader 的传输连接重连（addNode）——都不必等问完。
      */
@@ -385,7 +429,17 @@ export class LeaderElection {
         // 清空时，就是最近一次已知的那个（问的正是它还在不在）。
         // 从来没有过 leader 时为 null，被问方改答它所知的 leader。
         const targetLeaderId = this._currentLeaderNodeId ?? this._lastKnownLeaderNodeId;
-        this._inquiry = { queryId, queue, current: null, timer: null, targetLeaderId };
+        this._inquiry = {
+            queryId, queue, current: null, timer: null, targetLeaderId,
+            targetSet: new Set(queue),
+            totalTargets: queue.length,
+            // 多数决门槛：被问的人里严格过半（>50%）回明确"在线"才算在线
+            requiredOnline: Math.floor(queue.length / 2) + 1,
+            responded: new Set(),
+            pendingLate: new Set(),
+            onlineCounts: new Map(),
+            onlineTerms: new Map(),
+        };
         this._askNext();
     }
 
@@ -393,9 +447,17 @@ export class LeaderElection {
         const inq = this._inquiry;
         if (!inq) return;
         if (inq.timer) { this._clearTimeout(inq.timer); inq.timer = null; }
+        // 提前收场：已得票数 + 剩余未问人数 + 已超时但可能迟答的人数，
+        // 全回"在线"也凑不够过半 → 结论已定，发起投票
+        const best = inq.onlineCounts.size ? Math.max(...inq.onlineCounts.values()) : 0;
+        if (best + inq.queue.length + inq.pendingLate.size < inq.requiredOnline) {
+            this._inquiry = null;
+            this._startElection();
+            return;
+        }
         const target = inq.queue.shift();
         if (target === undefined) {
-            // 全部问完，无人能确认 leader 在世 → 直接正式选举
+            // 全部问完仍未过半 → 发起投票
             this._inquiry = null;
             this._startElection();
             return;
@@ -424,7 +486,11 @@ export class LeaderElection {
     }
 
     _onAskTimeout() {
-        // 被问者超时没回 → 问下一个
+        // 被问者超时没回 → 问下一个；但它仍可能迟答，迟到的"在线"
+        // 同样计票，故先记入 pendingLate（提前收场的凑数计算包含它，
+        // 真收到应答时再移除）
+        const inq = this._inquiry;
+        if (inq && inq.current) inq.pendingLate.add(inq.current);
         this._askNext();
     }
 
@@ -498,6 +564,7 @@ export class LeaderElection {
             return;
         }
         this._currentTerm++;
+        this._electionNoticeTerm = this._currentTerm; // 本人参选同样是"已收到选举信息"
         this._state = 'candidate';
         this._currentLeaderNodeId = null;
         this._votesGranted.clear();
@@ -520,6 +587,7 @@ export class LeaderElection {
     }
 
     _becomeLeader() {
+        this._electionNoticeTerm = 0; // 新 leader 确立（就是本人），未决选举结束
         this._state = 'leader';
         this._clearElectionTimer();
         this._setLeader(this.nodeId);

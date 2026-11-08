@@ -160,6 +160,8 @@ export class LeaderElection {
         this._currentTerm = 0;
         this._votedFor = new Map();
         this._currentLeaderNodeId = null;
+        /** 最近一次已知的 leader：视图被断连清空后仍保留，供识别其直连重连 */
+        this._lastKnownLeaderNodeId = null;
         this._votesGranted = new Set();
 
         // ===== 预投票状态 =====
@@ -218,6 +220,17 @@ export class LeaderElection {
     addNode(nodeId) {
         if (nodeId === this.nodeId) return;
         this._connectedNodeIds.add(nodeId);
+        // 问询/探询期间，原 leader 的直连恢复了：此刻就停问，回到等待
+        // 它的心跳确认。断连时 leader 视图已被清空，若只靠下一次心跳到达
+        // 才取消（receiveHeartbeat 的路径），问询队列可能在一个心跳间隔
+        // 内问完并升级到预投票/选举——来不及。重连本身不算存活证据：
+        // 不恢复 leader 视图、不刷新存活时间戳，只重置选举计时器；若它
+        // 已不再是 leader，无心跳跟进，计时器到期后重新问询。
+        if (nodeId === this._lastKnownLeaderNodeId && (this._inquiry || this._probe)) {
+            this._cancelInquiry();
+            this._cancelProbe();
+            if (this._state !== 'leader') this._resetElectionTimer();
+        }
     }
 
     removeNode(nodeId) {
@@ -353,6 +366,8 @@ export class LeaderElection {
      * 顺序问询：一次只问一个；对方答无法确认、或在动态超时内没回，
      * 才问下一个；出现决定性确认立即停问。全部问完无人能确认，
      * 才转入预投票。任何时刻至多一问在途，不产生并发泛洪。
+     * 问询期间直连恢复同样即时停问：leader 心跳到达（receiveHeartbeat），
+     * 或原 leader 的传输连接重连（addNode）——都不必等问完。
      */
     _startInquiry() {
         if (!this._started || this._state === 'leader' || this._inquiry || this._probe) return;
@@ -618,6 +633,7 @@ export class LeaderElection {
         const changed = this._currentLeaderNodeId !== leaderNodeId;
         this._currentLeaderNodeId = leaderNodeId;
         if (changed) {
+            if (leaderNodeId !== null) this._lastKnownLeaderNodeId = leaderNodeId;
             // leader 变更：旧 leader 的存活证据作废，新 leader 重新积累
             this._lastLeaderHeartbeatAt = 0;
             this._lastRelayedHeartbeatAt = 0;

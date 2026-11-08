@@ -1073,5 +1073,77 @@ describe('Leader inquiry', () => {
         el.stop();
     });
 
+    it('leader reconnect during inquiry stops the asking immediately (no waiting for its next heartbeat)', async () => {
+        const { el, callbacks } = makeElection({
+            getMinQuorum: () => 2,
+            onSendLeaderQuery: vi.fn(),
+            onSendPreVoteReq: vi.fn(),
+            _testOptions: { heartbeatIntervalMs: 100, minElectionMs: 300, maxElectionMs: 320 },
+        });
+        el.start();
+        el.addNode('L');
+        el.addNode('B');
+        el.receiveHeartbeat(1, 'L'); // leader = L
+        el.removeNode('L'); // 直连断开：leader 视图清空
+        expect(el.getLeaderNodeId()).toBeNull();
+        await vi.advanceTimersByTimeAsync(330); // 超时 → 问询开始，问 B
+        expect(el._onSendLeaderQuery).toHaveBeenCalledTimes(1);
+        expect(el._onSendLeaderQuery).toHaveBeenCalledWith(0, 1, 'B');
+        el.addNode('L'); // 问到一半，L 的直连恢复 → 立刻停问
+        expect(el._inquiry).toBeNull();
+        // 重连不算存活证据：视图不恢复，等它的心跳来确认
+        expect(el.getLeaderNodeId()).toBeNull();
+        await vi.advanceTimersByTimeAsync(250); // 不升级到预投票/选举
+        expect(el._onSendLeaderQuery).toHaveBeenCalledTimes(1);
+        expect(el._onSendPreVoteReq).not.toHaveBeenCalled();
+        expect(callbacks.onSendVoteReq).not.toHaveBeenCalled();
+        el.stop();
+    });
+
+    it('reconnect of a non-leader peer during inquiry does not stop the asking', async () => {
+        const { el } = makeElection({
+            getMinQuorum: () => 2,
+            onSendLeaderQuery: vi.fn(),
+            _testOptions: { heartbeatIntervalMs: 100, minElectionMs: 300, maxElectionMs: 320 },
+        });
+        el.start();
+        el.addNode('L');
+        el.addNode('B');
+        el.receiveHeartbeat(1, 'L');
+        await vi.advanceTimersByTimeAsync(330); // 问询开始，先问 L
+        expect(el._onSendLeaderQuery).toHaveBeenCalledTimes(1);
+        el.addNode('X'); // 无关节点加入：不影响问询
+        expect(el._inquiry).not.toBeNull();
+        expect(el._onSendLeaderQuery).toHaveBeenCalledTimes(1);
+        el.receiveLeaderQueryAck(1, false, 'L', 1, 'L'); // L 无法确认 → 顺序推进到 B
+        expect(el._onSendLeaderQuery).toHaveBeenCalledTimes(2);
+        expect(el._onSendLeaderQuery).toHaveBeenCalledWith(0, 1, 'B');
+        el.stop();
+    });
+
+    it('leader reconnect during pre-vote cancels the probe', async () => {
+        const { el, callbacks } = makeElection({
+            getMinQuorum: () => 2,
+            onSendLeaderQuery: vi.fn(),
+            onSendPreVoteReq: vi.fn(),
+            getPeerRttMs: () => 10, // 问询超时 = 1.5×10+50 = 65ms，B 不答即问完
+            _testOptions: { heartbeatIntervalMs: 100, minElectionMs: 300, maxElectionMs: 320 },
+        });
+        el.start();
+        el.addNode('L');
+        el.addNode('B');
+        el.receiveHeartbeat(1, 'L');
+        el.removeNode('L'); // leader 直连断开
+        await vi.advanceTimersByTimeAsync(330); // 问询开始，问 B
+        await vi.advanceTimersByTimeAsync(100); // B 超时 → 问完 → 转入预投票
+        expect(el._onSendPreVoteReq).toHaveBeenCalled();
+        expect(el._probe).not.toBeNull();
+        el.addNode('L'); // 探询期间 L 直连恢复 → 探询取消
+        expect(el._probe).toBeNull();
+        await vi.advanceTimersByTimeAsync(250);
+        expect(callbacks.onSendVoteReq).not.toHaveBeenCalled();
+        el.stop();
+    });
+
     afterEach(() => { vi.useRealTimers(); });
 });

@@ -43,8 +43,11 @@
  *   leader 是 X，X 还在不在"；被问方只就 X 作答，结论必须来自自己的
  *   直连证据：只有自己就是 X、或近期收到过 X 的直连心跳，才回明确
  *   "在线"；若它对 X 在世的认知也是问别人问来的，只能回中间结论
- *   "在线，但是我是问的别人"，不许把二手结论放大成明确结论；若它
- *   自己也正在问的过程中（还没有结论），回"不确定"。回复一共四种：
+ *   "在线，但是我是问的别人"，不许把二手结论放大成明确结论；"不
+ *   在线了"只留给一种情况——X 就是它自己的 leader、但它手里的证据
+ *   都已过期；X 不是它的 leader 时，它对 X 的死活根本无从判断，回
+ *   "不确定"（不是同一个 leader，因此不知道），它自己也正在问的
+ *   过程中同样回"不确定"。回复一共四种：
  *   在线 / 在线，但是我是问的别人 / 不在线了 / 不确定。收结论按多数
  *   决：只认第一种，且被问的人里严格过半回明确"在线"，才认为 leader
  *   在线——停问、刷新 leader 存活时间，本轮结束；达不到过半（或剩余
@@ -335,11 +338,14 @@ export class LeaderElection {
      *   'online_indirect'（在线，但是我是问的别人）——本节点对 X 在世
      *     的最新证据不是直连得来的，而是自己问别人问来的（问询确认）：
      *     只报这个中间结论，不许放大成明确"在线"；
-     *   'offline'（不在线了）——按本节点的直连观察，X 不在线：没有
-     *     新鲜直连证据，或本节点的 leader 根本不是 X（本节点收到的
-     *     直连心跳来自另一个 leader，对 X 无话可说）；
-     *   'uncertain'（不确定）——本节点自己也正在问 X 的过程中，还没有
-     *     结论：既不能说它在线，也不能说它不在线。
+     *   'offline'（不在线了）——X 就是本节点的 leader，但按本节点的
+     *     直连观察它已经不在了：直连心跳与问询确认的证据都已过期，
+     *     且本节点不在问询过程中。这个结论只对"是我 leader 的那个"
+     *     成立，不许拿去说别人；
+     *   'uncertain'（不确定）——本节点给不出关于 X 的结论：X 根本不是
+     *     本节点的 leader（不是同一个 leader，本节点收到的直连心跳
+     *     来自另一个 leader，对 X 的死活一无所知——这不等于 X 不在
+     *     线），或本节点自己也正在问 X 的过程中、还没有结论。
      * 应答的 leaderId 就是所问的那个 leader（subject）。
      */
     receiveLeaderQuery(queryId, askerId, targetLeaderId) {
@@ -348,22 +354,21 @@ export class LeaderElection {
         if (this._state !== 'leader' && this._electionNoticeTerm > 0 &&
             this._electionNoticeTerm >= this._currentTerm) return;
         const subject = targetLeaderId ?? this._currentLeaderNodeId;
-        let verdict = 'offline';
-        if (subject !== null) {
+        let verdict = 'uncertain'; // 兜底：给不出结论（不是同一个 leader / 没有视图）
+        if (subject !== null && this._state === 'leader' && subject === this.nodeId) {
+            verdict = 'online'; // 问的就是我，我在（本人没有自己的心跳时间戳，须先判这条）
+        } else if (subject !== null && this._currentLeaderNodeId === subject) {
+            // X 就是本节点的 leader，才轮得到按本节点的证据下结论
             const now = this._getNowMs();
-            if (this._state === 'leader' && subject === this.nodeId) {
-                verdict = 'online'; // 问的就是我，我在
-            } else if (this._currentLeaderNodeId === subject &&
-                       now - this._lastLeaderHeartbeatAt < this._computeElectionMin()) {
+            if (now - this._lastLeaderHeartbeatAt < this._computeElectionMin()) {
                 verdict = 'online'; // 据我直连收到的心跳，它在
             } else if (this._inquiry && this._inquiry.targetLeaderId === subject) {
                 verdict = 'uncertain'; // 我自己也正在问它，还没有结论
-            } else if (this._currentLeaderNodeId === subject &&
-                       now - this._lastRelayedHeartbeatAt < this._computeElectionMin()) {
+            } else if (now - this._lastRelayedHeartbeatAt < this._computeElectionMin()) {
                 verdict = 'online_indirect'; // 在线，但是我是问的别人
+            } else {
+                verdict = 'offline'; // 是我的 leader，但我的证据都过期了：不在线了
             }
-        } else if (this._inquiry) {
-            verdict = 'uncertain'; // 没点名、我也没有 leader 视图，而我正在问
         }
         this._onSendLeaderQueryAck(this.shardId, queryId, askerId, verdict, subject, this._currentTerm);
     }

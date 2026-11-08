@@ -1087,7 +1087,7 @@ describe('Leader inquiry', () => {
         el.stop();
     });
 
-    it('responder verdicts: only three replies, all from its own direct evidence about the asked leader', async () => {
+    it('responder verdicts: four replies, each with an exact meaning, all from its own direct evidence about the asked leader', async () => {
         // 被问的就是本节点的 leader，且直连心跳新鲜 → "在线"
         const direct = makeElection({ onSendLeaderQueryAck: vi.fn() });
         direct.el.start();
@@ -1116,31 +1116,43 @@ describe('Leader inquiry', () => {
         expect(relayed.el._onSendLeaderQueryAck).toHaveBeenCalledWith(0, 9, 'asker', 'online_indirect', 'L', 1);
         relayed.el.stop();
 
-        // 没有任何新鲜证据 → "不在线了"（应答回显所问的 leader）
+        // 被问的就是本节点的 leader，但直连与问询确认的证据都已过期 → "不在线了"
+        const stale = makeElection({ onSendLeaderQueryAck: vi.fn() });
+        stale.el.start();
+        stale.el.addNode('L');
+        stale.el.receiveHeartbeat(1, 'L');
+        stale.el._lastLeaderHeartbeatAt = 0; // 证据强制过期（且不在问询过程中）
+        stale.el._lastRelayedHeartbeatAt = 0;
+        stale.el.receiveLeaderQuery(9, 'asker', 'L');
+        expect(stale.el._onSendLeaderQueryAck).toHaveBeenCalledWith(0, 9, 'asker', 'offline', 'L', 1);
+        stale.el.stop();
+
+        // 没有 leader 视图、被问一个自己不跟随的 leader → 无从判断 → "不确定"（应答回显所问的 leader）
         const none = makeElection({ onSendLeaderQueryAck: vi.fn() });
         none.el.start();
         none.el.addNode('L');
         none.el.receiveLeaderQuery(9, 'asker', 'L');
-        expect(none.el._onSendLeaderQueryAck).toHaveBeenCalledWith(0, 9, 'asker', 'offline', 'L', 0);
+        expect(none.el._onSendLeaderQueryAck).toHaveBeenCalledWith(0, 9, 'asker', 'uncertain', 'L', 0);
         none.el.stop();
 
-        // 本节点的 leader 是另一个（直连心跳来自 Y）：被问 X 时不许拿 Y 的心跳给 X 背书 → "不在线了"
+        // 本节点的 leader 是另一个（直连心跳来自 Y）：被问 X 时不许拿 Y 的心跳给 X 背书；
+        // 但 X 不是它的 leader，它对 X 的死活根本不知道 → "不确定"，不是"不在线了"
         const other = makeElection({ onSendLeaderQueryAck: vi.fn() });
         other.el.start();
         other.el.addNode('Y');
         other.el.receiveHeartbeat(1, 'Y');
         other.el.receiveLeaderQuery(9, 'asker', 'X');
-        expect(other.el._onSendLeaderQueryAck).toHaveBeenCalledWith(0, 9, 'asker', 'offline', 'X', 1);
+        expect(other.el._onSendLeaderQueryAck).toHaveBeenCalledWith(0, 9, 'asker', 'uncertain', 'X', 1);
         other.el.stop();
 
-        // 自己是 leader，但被问的是另一个 leader → 对那个无话可说 → "不在线了"
+        // 自己是 leader，但被问的是另一个 leader → 不是同一个 leader，不知道 → "不确定"
         const selfOther = makeElection({ onSendLeaderQueryAck: vi.fn() });
         selfOther.el.start();
         selfOther.el.triggerElection();
         await vi.advanceTimersByTimeAsync(1);
         expect(selfOther.el.isLeader()).toBe(true);
         selfOther.el.receiveLeaderQuery(9, 'asker', 'X');
-        expect(selfOther.el._onSendLeaderQueryAck).toHaveBeenCalledWith(0, 9, 'asker', 'offline', 'X', 1);
+        expect(selfOther.el._onSendLeaderQueryAck).toHaveBeenCalledWith(0, 9, 'asker', 'uncertain', 'X', 1);
         selfOther.el.stop();
 
         // 自己也正在问同一个 leader 的过程中 → "不确定"（还没有结论）

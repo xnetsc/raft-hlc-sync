@@ -135,8 +135,6 @@ import {
     makeLeaderHeartbeat,
     makeVoteReq,
     makeVoteAck,
-    makePreVoteReq,
-    makePreVoteAck,
     makeLeaderQuery,
     makeLeaderQueryAck,
     makeProxyReq,
@@ -963,12 +961,12 @@ export class SyncEngine {
             }
             case 'leader_query': {
                 const el = this._shardElections.get(msg.shardId);
-                if (el) el.receiveLeaderQuery(msg.queryId, msg.askerId);
+                if (el) el.receiveLeaderQuery(msg.queryId, msg.askerId, msg.targetLeaderId ?? null);
                 break;
             }
             case 'leader_query_ack': {
                 const el = this._shardElections.get(msg.shardId);
-                if (el) el.receiveLeaderQueryAck(msg.queryId, msg.alive, msg.leaderId, msg.term, msg.responderId);
+                if (el) el.receiveLeaderQueryAck(msg.queryId, msg.verdict, msg.leaderId, msg.term, msg.responderId);
                 break;
             }
             case 'vote_req': {
@@ -979,16 +977,6 @@ export class SyncEngine {
             case 'vote_ack': {
                 const el = this._shardElections.get(msg.shardId);
                 if (el) el.receiveVoteAck(msg.term, msg.candidateId, msg.granted, msg.voterId);
-                break;
-            }
-            case 'prevote_req': {
-                const el = this._shardElections.get(msg.shardId);
-                if (el) el.receivePreVoteReq(msg.term, msg.candidateId, msg.priority ?? 0);
-                break;
-            }
-            case 'prevote_ack': {
-                const el = this._shardElections.get(msg.shardId);
-                if (el) el.receivePreVoteAck(msg.term, msg.candidateId, msg.granted, msg.voterId);
                 break;
             }
             case 'proxy_req':    this._handleProxyReq(peerId, msg); break;
@@ -1603,25 +1591,16 @@ export class SyncEngine {
                         this._sendToPeer(peerId, makeVoteAck(sid, term, candidateId, granted, this.nodeId));
                     }
                 },
-                onSendPreVoteReq: (sid, term, candidateId, priority) => {
-                    this._broadcastToAll(makePreVoteReq(sid, term, candidateId, priority));
-                },
-                onSendPreVoteAck: (sid, term, candidateId, granted) => {
-                    const peerId = this._nodeIdToPeerId.get(candidateId);
-                    if (peerId) {
-                        this._sendToPeer(peerId, makePreVoteAck(sid, term, candidateId, granted, this.nodeId));
-                    }
-                },
-                onSendLeaderQuery: (sid, queryId, targetNodeId) => {
+                onSendLeaderQuery: (sid, queryId, targetNodeId, targetLeaderId) => {
                     const peerId = this._nodeIdToPeerId.get(targetNodeId);
                     if (peerId) {
-                        this._sendToPeer(peerId, makeLeaderQuery(sid, queryId, this.nodeId));
+                        this._sendToPeer(peerId, makeLeaderQuery(sid, queryId, this.nodeId, targetLeaderId));
                     }
                 },
-                onSendLeaderQueryAck: (sid, queryId, askerId, alive, leaderId, term) => {
+                onSendLeaderQueryAck: (sid, queryId, askerId, verdict, leaderId, term) => {
                     const peerId = this._nodeIdToPeerId.get(askerId);
                     if (peerId) {
-                        this._sendToPeer(peerId, makeLeaderQueryAck(sid, queryId, alive, leaderId, term, this.nodeId));
+                        this._sendToPeer(peerId, makeLeaderQueryAck(sid, queryId, verdict, leaderId, term, this.nodeId));
                     }
                 },
                 onLeaderChanged: (sid, leaderNodeId, isLocal) => {

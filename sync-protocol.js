@@ -225,12 +225,12 @@ export function makeLeaderHeartbeat(shardId, term, leaderId) {
     return JSON.stringify({ type: 'leader_heartbeat', shardId, term, leaderId });
 }
 
-export function makeLeaderQuery(shardId, queryId, askerId) {
-    return JSON.stringify({ type: 'leader_query', shardId, queryId, askerId });
+export function makeLeaderQuery(shardId, queryId, askerId, targetLeaderId) {
+    return JSON.stringify({ type: 'leader_query', shardId, queryId, askerId, targetLeaderId: targetLeaderId ?? null });
 }
 
-export function makeLeaderQueryAck(shardId, queryId, alive, leaderId, term, responderId) {
-    return JSON.stringify({ type: 'leader_query_ack', shardId, queryId, alive, leaderId, term, responderId });
+export function makeLeaderQueryAck(shardId, queryId, verdict, leaderId, term, responderId) {
+    return JSON.stringify({ type: 'leader_query_ack', shardId, queryId, verdict, leaderId, term, responderId });
 }
 
 export function makeVoteReq(shardId, term, candidateId, priority) {
@@ -239,14 +239,6 @@ export function makeVoteReq(shardId, term, candidateId, priority) {
 
 export function makeVoteAck(shardId, term, candidateId, granted, voterId) {
     return JSON.stringify({ type: 'vote_ack', shardId, term, candidateId, granted, voterId });
-}
-
-export function makePreVoteReq(shardId, term, candidateId, priority) {
-    return JSON.stringify({ type: 'prevote_req', shardId, term, candidateId, priority });
-}
-
-export function makePreVoteAck(shardId, term, candidateId, granted, voterId) {
-    return JSON.stringify({ type: 'prevote_ack', shardId, term, candidateId, granted, voterId });
 }
 
 // ----- 写请求代理消息（payload 对模块透明） -----

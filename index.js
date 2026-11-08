@@ -208,8 +208,6 @@ export {
     makeLeaderHeartbeat,
     makeVoteReq,
     makeVoteAck,
-    makePreVoteReq,
-    makePreVoteAck,
     makeLeaderQuery,
     makeLeaderQueryAck,
     makeProxyReq,

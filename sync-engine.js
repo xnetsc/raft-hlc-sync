@@ -1172,12 +1172,6 @@ export class SyncEngine {
      * 适用于多节点部署下需要强一致性的写操作。
      * 引擎自动完成：BEGIN → 执行 fn → 广播 prepare → 等待 quorum ack → COMMIT → 广播 commit
      *
-     * 若当前已存在手动事务（beginManualTransaction 已开启，或正处于另一个
-     * write() 的回调中），本次调用并入该事务：只执行 fn，不再开启新事务、
-     * 不单独发 prepare/commit。fn 产生的变更由变更触发器记入 _sync_log，
-     * 统一由外层事务的持有者收集条目并完成 prepare/commit——与手动事务模式
-     * 下「事务内写操作靠触发器捕获」的设计一致。
-     *
      * @param {function(db: DatabaseAdapter): any} fn - 写操作函数，在事务中执行
      *   fn 接收 db 适配器，可直接调用 db.run/get/all 执行业务写操作。
      *   fn 的返回值会作为 write() 的返回值透传。
@@ -1192,12 +1186,6 @@ export class SyncEngine {
      * }, userId);
      */
     async write(fn, shardKey) {
-        // 并入模式：已有手动事务（或外层 write 的事务）时只执行写函数本身，
-        // 事务边界与 2PC 协调归外层持有者，本次调用不重复开启/提交。
-        if (this._activeManualTxn) {
-            return await fn(this.db);
-        }
-
         const writeId = randomUUID();
         const shardId = shardKey ? this.getShardId(shardKey) : 0;
         const term = this._shardElections.get(shardId)?._currentTerm || 0;

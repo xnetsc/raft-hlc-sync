@@ -135,6 +135,10 @@ import {
     makeLeaderHeartbeat,
     makeVoteReq,
     makeVoteAck,
+    makePreVoteReq,
+    makePreVoteAck,
+    makeLeaderQuery,
+    makeLeaderQueryAck,
     makeProxyReq,
     makeProxyRes,
     makePrepare,
@@ -957,6 +961,16 @@ export class SyncEngine {
                 if (el) el.receiveHeartbeat(msg.term, msg.leaderId);
                 break;
             }
+            case 'leader_query': {
+                const el = this._shardElections.get(msg.shardId);
+                if (el) el.receiveLeaderQuery(msg.queryId, msg.askerId);
+                break;
+            }
+            case 'leader_query_ack': {
+                const el = this._shardElections.get(msg.shardId);
+                if (el) el.receiveLeaderQueryAck(msg.queryId, msg.alive, msg.leaderId, msg.term, msg.responderId);
+                break;
+            }
             case 'vote_req': {
                 const el = this._shardElections.get(msg.shardId);
                 if (el) el.receiveVoteReq(msg.term, msg.candidateId, msg.priority ?? 0);
@@ -965,6 +979,16 @@ export class SyncEngine {
             case 'vote_ack': {
                 const el = this._shardElections.get(msg.shardId);
                 if (el) el.receiveVoteAck(msg.term, msg.candidateId, msg.granted, msg.voterId);
+                break;
+            }
+            case 'prevote_req': {
+                const el = this._shardElections.get(msg.shardId);
+                if (el) el.receivePreVoteReq(msg.term, msg.candidateId, msg.priority ?? 0);
+                break;
+            }
+            case 'prevote_ack': {
+                const el = this._shardElections.get(msg.shardId);
+                if (el) el.receivePreVoteAck(msg.term, msg.candidateId, msg.granted, msg.voterId);
                 break;
             }
             case 'proxy_req':    this._handleProxyReq(peerId, msg); break;
@@ -1550,6 +1574,16 @@ export class SyncEngine {
                  */
                 getNetworkRttMs: () => this._getBestNetworkRttMs(),
                 /**
+                 * 单个 peer 的近期典型 RTT（对时窗口内样本均值），供存活问询
+                 * 动态定超时：前几次通信多快，这次大概率还是多快。
+                 */
+                getPeerRttMs: (nodeId) => {
+                    const pid = this._nodeIdToPeerId.get(nodeId);
+                    const st = pid ? this._timeSyncStates.get(pid) : null;
+                    if (!st || st.rtts.length === 0) return null;
+                    return st.rtts.reduce((a, b) => a + b, 0) / st.rtts.length;
+                },
+                /**
                  * 返回所有 peer 中最大的时钟误差上界 ε（ms），用于计算 Leader 租约时长。
                  * 无对时数据时返回 Infinity（租约不可用）。
                  */
@@ -1567,6 +1601,27 @@ export class SyncEngine {
                     const peerId = this._nodeIdToPeerId.get(candidateId);
                     if (peerId) {
                         this._sendToPeer(peerId, makeVoteAck(sid, term, candidateId, granted, this.nodeId));
+                    }
+                },
+                onSendPreVoteReq: (sid, term, candidateId, priority) => {
+                    this._broadcastToAll(makePreVoteReq(sid, term, candidateId, priority));
+                },
+                onSendPreVoteAck: (sid, term, candidateId, granted) => {
+                    const peerId = this._nodeIdToPeerId.get(candidateId);
+                    if (peerId) {
+                        this._sendToPeer(peerId, makePreVoteAck(sid, term, candidateId, granted, this.nodeId));
+                    }
+                },
+                onSendLeaderQuery: (sid, queryId, targetNodeId) => {
+                    const peerId = this._nodeIdToPeerId.get(targetNodeId);
+                    if (peerId) {
+                        this._sendToPeer(peerId, makeLeaderQuery(sid, queryId, this.nodeId));
+                    }
+                },
+                onSendLeaderQueryAck: (sid, queryId, askerId, alive, leaderId, term) => {
+                    const peerId = this._nodeIdToPeerId.get(askerId);
+                    if (peerId) {
+                        this._sendToPeer(peerId, makeLeaderQueryAck(sid, queryId, alive, leaderId, term, this.nodeId));
                     }
                 },
                 onLeaderChanged: (sid, leaderNodeId, isLocal) => {

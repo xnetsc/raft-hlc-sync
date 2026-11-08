@@ -674,3 +674,404 @@ describe('getStatus', () => {
         expect(el.getStatus().connectedNodes).toBe(3);
     });
 });
+
+// ═══════════════════════════════════════════════════
+//  Pre-Vote（预投票）
+// ═══════════════════════════════════════════════════
+
+function makeCluster(ids, quorum) {
+    const net = {};
+    const hbBlock = new Set();
+    for (const id of ids) {
+        const sent = {
+            onSendLeaderQuery: vi.fn((sid, queryId, target) => {
+                net[target].el.receiveLeaderQuery(queryId, id);
+            }),
+            onSendLeaderQueryAck: vi.fn((sid, queryId, askerId, alive, leaderId, term) => {
+                net[askerId].el.receiveLeaderQueryAck(queryId, alive, leaderId, term, id);
+            }),
+            onSendPreVoteReq: vi.fn((sid, term, cand, prio) => {
+                for (const o of ids) if (o !== id) net[o].el.receivePreVoteReq(term, cand, prio);
+            }),
+            onSendPreVoteAck: vi.fn((sid, term, cand, granted) => {
+                net[cand].el.receivePreVoteAck(term, cand, granted, id);
+            }),
+            onSendVoteReq: vi.fn((sid, term, cand, prio) => {
+                for (const o of ids) if (o !== id) net[o].el.receiveVoteReq(term, cand, prio);
+            }),
+            onSendVoteAck: vi.fn((sid, term, cand, granted) => {
+                net[cand].el.receiveVoteAck(term, cand, granted, id);
+            }),
+            onSendHeartbeat: vi.fn((sid, term, leaderId) => {
+                for (const o of ids) if (o !== id && !hbBlock.has(o)) net[o].el.receiveHeartbeat(term, leaderId);
+            }),
+        };
+        const { el } = makeElection({
+            nodeId: id,
+            getMinQuorum: () => quorum,
+            _testOptions: { heartbeatIntervalMs: 100, minElectionMs: 300, maxElectionMs: 400 },
+            ...sent,
+        });
+        const asked = { count: 0 };
+        const origReceiveQuery = el.receiveLeaderQuery.bind(el);
+        el.receiveLeaderQuery = (qid, asker) => { asked.count++; return origReceiveQuery(qid, asker); };
+        net[id] = { el, sent, asked };
+    }
+    for (const id of ids) for (const o of ids) if (o !== id) net[id].el.addNode(o);
+    return { net, hbBlock };
+}
+
+describe('Pre-Vote', () => {
+    beforeEach(() => { vi.useFakeTimers(); });
+
+    it('receiver refuses when it heard the leader within the min election window, without side effects', () => {
+        const { el, callbacks } = makeElection({
+            onSendPreVoteAck: vi.fn(),
+        });
+        el.start();
+        el.addNode('leader-1');
+        el.addNode('cand-1');
+        el.receiveHeartbeat(1, 'leader-1');
+        el.receivePreVoteReq(2, 'cand-1', 0.5);
+        expect(el._onSendPreVoteAck).toHaveBeenCalledWith(0, 2, 'cand-1', false);
+        // 探询不扰动接收方：term 不变、leader 视图不变、没有投出正式票
+        expect(el.getStatus().term).toBe(1);
+        expect(el.getLeaderNodeId()).toBe('leader-1');
+        expect(callbacks.onSendVoteAck).not.toHaveBeenCalled();
+        el.stop();
+    });
+
+    it('receiver grants when the leader has been silent beyond the window, and the intention does not consume the formal vote', () => {
+        const { el, callbacks } = makeElection({ onSendPreVoteAck: vi.fn() });
+        el.start();
+        el.addNode('leader-1');
+        el.addNode('cand-1');
+        el.receiveHeartbeat(1, 'leader-1');
+        el._lastLeaderHeartbeatAt = Date.now() - 100000; // leader 久无心跳
+        el.receivePreVoteReq(2, 'cand-1', 0.5);
+        expect(el._onSendPreVoteAck).toHaveBeenCalledWith(0, 2, 'cand-1', true);
+        // 意向票不是正式票：随后同 term 的正式 vote_req 仍应获得投票
+        el.receiveVoteReq(2, 'cand-1', 0.5);
+        expect(callbacks.onSendVoteAck).toHaveBeenCalledWith(0, 2, 'cand-1', true);
+        el.stop();
+    });
+
+    it('the leader itself always refuses', () => {
+        const { el } = makeElection({ onSendPreVoteAck: vi.fn() });
+        el.start();
+        el.addNode('node-1');
+        el.addNode('node-2');
+        el.triggerElection();
+        el.receiveVoteAck(1, 'node-0', true, 'node-1');
+        expect(el.isLeader()).toBe(true);
+        el.receivePreVoteReq(2, 'node-1', 0.9);
+        expect(el._onSendPreVoteAck).toHaveBeenCalledWith(0, 2, 'node-1', false);
+        el.stop();
+    });
+
+    it('a node that cannot hear the leader cannot force a re-election while the majority still can', async () => {
+        const { net, hbBlock } = makeCluster(['A', 'B', 'C'], 2);
+        for (const id of ['A', 'B', 'C']) net[id].el.start();
+        net.A.el.triggerElection();
+        expect(net.A.el.isLeader()).toBe(true);
+        const term = net.A.el.getStatus().term;
+
+        hbBlock.add('C'); // C 与 leader 的链路断了，但与 B 互通
+        await vi.advanceTimersByTimeAsync(1500);
+
+        // C 先走存活问询：A（leader 本人）确认在世 → 问询即解决，连预投票都不必
+        expect(net.C.sent.onSendLeaderQuery.mock.calls.length).toBeGreaterThanOrEqual(1);
+        expect(net.C.sent.onSendPreVoteReq).not.toHaveBeenCalled();
+        expect(net.C.sent.onSendVoteReq).not.toHaveBeenCalled();
+        expect(net.A.el.isLeader()).toBe(true);
+        for (const id of ['A', 'B', 'C']) {
+            expect(net[id].el.getStatus().term).toBe(term);
+            expect(net[id].el.getLeaderNodeId()).toBe('A');
+        }
+        for (const id of ['A', 'B', 'C']) net[id].el.stop();
+    });
+
+    it('when the leader truly dies, the survivors still elect a new one through pre-vote', async () => {
+        const { net } = makeCluster(['A', 'B', 'C'], 2);
+        for (const id of ['A', 'B', 'C']) net[id].el.start();
+        net.A.el.triggerElection();
+        expect(net.A.el.isLeader()).toBe(true);
+
+        net.A.el.stop(); // leader 真死：心跳停止
+        await vi.advanceTimersByTimeAsync(5000);
+
+        const leaders = ['B', 'C'].filter((id) => net[id].el.isLeader());
+        expect(leaders.length).toBe(1);
+        const other = leaders[0] === 'B' ? 'C' : 'B';
+        expect(net[other].el.getLeaderNodeId()).toBe(leaders[0]);
+        net.B.el.stop();
+        net.C.el.stop();
+    });
+
+    it('fresh cluster elects a leader through the pre-vote path', async () => {
+        const { net } = makeCluster(['A', 'B', 'C'], 2);
+        for (const id of ['A', 'B', 'C']) net[id].el.start();
+        await vi.advanceTimersByTimeAsync(5000);
+        const leaders = ['A', 'B', 'C'].filter((id) => net[id].el.isLeader());
+        expect(leaders.length).toBe(1);
+        for (const id of ['A', 'B', 'C']) {
+            if (id !== leaders[0]) expect(net[id].el.getLeaderNodeId()).toBe(leaders[0]);
+        }
+        // 胜者确实先走了预投票再正式参选
+        expect(net[leaders[0]].sent.onSendPreVoteReq.mock.calls.length).toBeGreaterThanOrEqual(1);
+        for (const id of ['A', 'B', 'C']) net[id].el.stop();
+    });
+
+    it('zero pre-vote replies fall back to a direct election (mixed-version liveness)', async () => {
+        const { el, callbacks } = makeElection({ getMinQuorum: () => 2 });
+        el.start();
+        el.addNode('node-1');
+        el.addNode('node-2');
+        await vi.advanceTimersByTimeAsync(500);
+        // 未注入预投票回调 → 探询零回复 → 回退直接选举
+        expect(callbacks.onSendVoteReq).toHaveBeenCalled();
+        expect(el.getStatus().state).toBe('candidate');
+        el.receiveVoteAck(el.getStatus().term, 'node-0', true, 'node-1');
+        expect(el.isLeader()).toBe(true);
+        el.stop();
+    });
+
+    it('an accepted heartbeat cancels an in-flight inquiry', async () => {
+        const sentQuery = vi.fn();
+        const { el, callbacks } = makeElection({
+            getMinQuorum: () => 2,
+            onSendLeaderQuery: sentQuery,
+            _testOptions: { heartbeatIntervalMs: 100, minElectionMs: 300, maxElectionMs: 320 },
+        });
+        el.start();
+        el.addNode('A');
+        el.addNode('B');
+        await vi.advanceTimersByTimeAsync(330); // 选举超时 → 问询开始（窗口 300ms，未到期）
+        expect(sentQuery).toHaveBeenCalled();
+        el.receiveHeartbeat(1, 'A'); // 链路恢复，leader 还在：问询取消
+        expect(el._inquiry).toBeNull();
+        // 迟到的问询应答不得再推进流程
+        el.receiveLeaderQueryAck(1, false, null, 1, 'B');
+        el.receiveLeaderQueryAck(1, false, null, 1, 'A');
+        await vi.advanceTimersByTimeAsync(200);
+        expect(callbacks.onSendVoteReq).not.toHaveBeenCalled();
+        expect(el.getStatus().state).toBe('follower');
+        el.stop();
+    });
+
+    afterEach(() => { vi.useRealTimers(); });
+});
+
+// ═══════════════════════════════════════════════════
+//  Relayed heartbeat（传递心跳）
+// ═══════════════════════════════════════════════════
+
+describe('Relayed heartbeat', () => {
+    beforeEach(() => { vi.useFakeTimers(); });
+
+    it('accepts a relayed heartbeat from a leader it is not directly connected to', async () => {
+        const { el } = makeElection({ getMinQuorum: () => 2 });
+        el.start();
+        el.addNode('relay-peer'); // 直连的是中继者，不是 leader 本人
+        el.receiveHeartbeat(3, 'far-leader', { relayed: true });
+        expect(el.getLeaderNodeId()).toBe('far-leader');
+        expect(el.getStatus().term).toBe(3);
+        // 传递心跳同样刷新存活证据：选举计时器被重置，不会立刻探询
+        await vi.advanceTimersByTimeAsync(30);
+        expect(el.getStatus().state).toBe('follower');
+        el.stop();
+    });
+
+    it('rejects a direct heartbeat from a non-connected leader (unchanged rule)', () => {
+        const { el } = makeElection();
+        el.start();
+        el.addNode('someone');
+        el.receiveHeartbeat(3, 'far-leader');
+        expect(el.getLeaderNodeId()).toBeNull();
+        el.stop();
+    });
+
+    it('ignores its own heartbeat coming back through a relay', () => {
+        const { el } = makeElection();
+        el.start();
+        el.addNode('relay-peer');
+        el.receiveHeartbeat(2, 'node-0', { relayed: true }); // node-0 是自己
+        expect(el.getLeaderNodeId()).toBeNull();
+        el.stop();
+    });
+
+    afterEach(() => { vi.useRealTimers(); });
+});
+
+// ═══════════════════════════════════════════════════
+//  Relay grace / repair（传递存活修复窗口）
+// ═══════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════
+//  Leader inquiry（存活问询）
+// ═══════════════════════════════════════════════════
+
+function makeInquiryCluster(ids, quorum) {
+    const net = {};
+    const hbBlock = new Set();
+    for (const id of ids) {
+        const sent = {
+            onSendLeaderQuery: vi.fn((sid, queryId, target) => {
+                net[target].el.receiveLeaderQuery(queryId, id);
+            }),
+            onSendLeaderQueryAck: vi.fn((sid, queryId, askerId, alive, leaderId, term) => {
+                net[askerId].el.receiveLeaderQueryAck(queryId, alive, leaderId, term, id);
+            }),
+            onSendPreVoteReq: vi.fn((sid, term, cand, prio) => {
+                for (const o of ids) if (o !== id) net[o].el.receivePreVoteReq(term, cand, prio);
+            }),
+            onSendPreVoteAck: vi.fn((sid, term, cand, granted) => {
+                net[cand].el.receivePreVoteAck(term, cand, granted, id);
+            }),
+            onSendVoteReq: vi.fn((sid, term, cand, prio) => {
+                for (const o of ids) if (o !== id) net[o].el.receiveVoteReq(term, cand, prio);
+            }),
+            onSendVoteAck: vi.fn((sid, term, cand, granted) => {
+                net[cand].el.receiveVoteAck(term, cand, granted, id);
+            }),
+            onSendHeartbeat: vi.fn((sid, term, leaderId) => {
+                for (const o of ids) if (o !== id && !hbBlock.has(o)) net[o].el.receiveHeartbeat(term, leaderId);
+            }),
+        };
+        const { el } = makeElection({
+            nodeId: id,
+            getMinQuorum: () => quorum,
+            _testOptions: { heartbeatIntervalMs: 100, minElectionMs: 300, maxElectionMs: 400 },
+            ...sent,
+        });
+        const asked = { count: 0 };
+        const origReceiveQuery = el.receiveLeaderQuery.bind(el);
+        el.receiveLeaderQuery = (qid, asker) => { asked.count++; return origReceiveQuery(qid, asker); };
+        net[id] = { el, sent, asked };
+    }
+    for (const id of ids) for (const o of ids) if (o !== id) net[id].el.addNode(o);
+    return { net, hbBlock };
+}
+
+describe('Leader inquiry', () => {
+    beforeEach(() => { vi.useFakeTimers(); });
+
+    it('a node cut off from the leader stands down when peers confirm the leader is alive', async () => {
+        const { net, hbBlock } = makeInquiryCluster(['A', 'B', 'C'], 2);
+        for (const id of ['A', 'B', 'C']) net[id].el.start();
+        net.A.el.triggerElection();
+        expect(net.A.el.isLeader()).toBe(true);
+        const term = net.A.el.getStatus().term;
+
+        hbBlock.add('C'); // C 听不到 leader 心跳，但与 A、B 直连互通
+        await vi.advanceTimersByTimeAsync(3000);
+
+        // C 顺序问询：第一个问的就是 leader A，得到确认即停 —— B 从未被问到
+        expect(net.C.sent.onSendLeaderQuery.mock.calls.length).toBeGreaterThanOrEqual(1);
+        expect(net.A.asked.count).toBeGreaterThanOrEqual(1);
+        expect(net.B.asked.count).toBe(0);
+        expect(net.C.sent.onSendPreVoteReq).not.toHaveBeenCalled();
+        expect(net.C.sent.onSendVoteReq).not.toHaveBeenCalled();
+        expect(net.A.el.isLeader()).toBe(true);
+        for (const id of ['A', 'B', 'C']) {
+            expect(net[id].el.getStatus().term).toBe(term);
+            expect(net[id].el.getLeaderNodeId()).toBe('A');
+        }
+        for (const id of ['A', 'B', 'C']) net[id].el.stop();
+    });
+
+    it('when no peer can confirm the leader, the node proceeds through pre-vote to a real election', async () => {
+        const { net } = makeInquiryCluster(['A', 'B', 'C'], 2);
+        for (const id of ['A', 'B', 'C']) net[id].el.start();
+        net.A.el.triggerElection();
+        expect(net.A.el.isLeader()).toBe(true);
+
+        net.A.el.stop(); // leader 真死
+        await vi.advanceTimersByTimeAsync(6000);
+
+        const leaders = ['B', 'C'].filter((id) => net[id].el.isLeader());
+        expect(leaders.length).toBe(1);
+        const other = leaders[0] === 'B' ? 'C' : 'B';
+        expect(net[other].el.getLeaderNodeId()).toBe(leaders[0]);
+        net.B.el.stop();
+        net.C.el.stop();
+    });
+
+    it('one decisive confirmation ends the inquiry (later acks are ignored)', async () => {
+        const { el, callbacks } = makeElection({
+            getMinQuorum: () => 2,
+            onSendLeaderQuery: vi.fn(),
+            onSendPreVoteReq: vi.fn(),
+            _testOptions: { heartbeatIntervalMs: 100, minElectionMs: 300, maxElectionMs: 320 },
+        });
+        el.start();
+        el.addNode('L');
+        el.addNode('B');
+        el.receiveHeartbeat(1, 'L');
+        await vi.advanceTimersByTimeAsync(330); // 超时 → 问询开始
+        expect(el._onSendLeaderQuery).toHaveBeenCalled();
+        el.receiveLeaderQueryAck(1, true, 'L', 1, 'B'); // 决定性确认
+        expect(el._inquiry).toBeNull();
+        el.receiveLeaderQueryAck(1, false, null, 1, 'L'); // 迟到应答：已结束，忽略
+        await vi.advanceTimersByTimeAsync(200);
+        expect(el._onSendPreVoteReq).not.toHaveBeenCalled();
+        expect(callbacks.onSendVoteReq).not.toHaveBeenCalled();
+        expect(el.getLeaderNodeId()).toBe('L');
+        el.stop();
+    });
+
+    it('an ack about a different leader (same term) is not decisive; sequence moves on and exhausts into pre-vote', async () => {
+        const { el, callbacks } = makeElection({
+            getMinQuorum: () => 2,
+            onSendLeaderQuery: vi.fn(),
+            onSendPreVoteReq: vi.fn(),
+            _testOptions: { heartbeatIntervalMs: 100, minElectionMs: 300, maxElectionMs: 320 },
+        });
+        el.start();
+        el.addNode('L');
+        el.addNode('B');
+        el.receiveHeartbeat(1, 'L');
+        await vi.advanceTimersByTimeAsync(330); // 问询开始，先问 L
+        expect(el._onSendLeaderQuery).toHaveBeenCalledTimes(1);
+        expect(el._onSendLeaderQuery).toHaveBeenCalledWith(0, 1, 'L');
+        el.receiveLeaderQueryAck(1, true, 'OTHER', 1, 'B'); // 非当前被问者的别域确认：不决定性、不推进
+        expect(el._inquiry).not.toBeNull();
+        expect(el._onSendLeaderQuery).toHaveBeenCalledTimes(1);
+        el.receiveLeaderQueryAck(1, false, 'L', 1, 'L'); // 当前被问者 L：无法确认 → 问下一个
+        expect(el._onSendLeaderQuery).toHaveBeenCalledTimes(2);
+        expect(el._onSendLeaderQuery).toHaveBeenCalledWith(0, 1, 'B');
+        el.receiveLeaderQueryAck(1, false, 'L', 1, 'B'); // B 也无法确认 → 全部问完
+        expect(el._onSendPreVoteReq).toHaveBeenCalled(); // 转入预投票
+        expect(callbacks.onSendVoteReq).not.toHaveBeenCalled();
+        el.stop();
+    });
+
+    it('per-ask timeout is dynamic: silent peer is skipped after its RTT-scaled timeout', async () => {
+        const { el } = makeElection({
+            getMinQuorum: () => 2,
+            onSendLeaderQuery: vi.fn(),
+            getPeerRttMs: (id) => (id === 'B' ? 10 : null),
+            _testOptions: { heartbeatIntervalMs: 100, minElectionMs: 300, maxElectionMs: 320 },
+        });
+        el.start();
+        el.addNode('B');
+        el.addNode('C');
+        el.receiveHeartbeat(1, 'B'); // 视图 leader=B（不影响问询目标顺序）
+        el._currentLeaderNodeId = 'L';
+        await vi.advanceTimersByTimeAsync(330); // 问询开始，先问 B（队列序）
+        expect(el._onSendLeaderQuery).toHaveBeenCalledTimes(1);
+        expect(el._onSendLeaderQuery).toHaveBeenCalledWith(0, 1, 'B');
+        // B 近期 RTT=10ms → 超时 = 1.5×10+50 = 65ms；未到期不推进，到期 B 不回 → 问 C
+        await vi.advanceTimersByTimeAsync(30);
+        expect(el._onSendLeaderQuery).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(60);
+        expect(el._onSendLeaderQuery).toHaveBeenCalledTimes(2);
+        expect(el._onSendLeaderQuery).toHaveBeenCalledWith(0, 1, 'C');
+        el.receiveLeaderQueryAck(1, true, 'L', 1, 'C'); // C 确认 → 停问
+        expect(el._inquiry).toBeNull();
+        expect(el.getLeaderNodeId()).toBe('L');
+        el.stop();
+    });
+
+    afterEach(() => { vi.useRealTimers(); });
+});
